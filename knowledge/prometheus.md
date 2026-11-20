@@ -1,0 +1,15 @@
+# Prometheus — TSDB, WAL, retention, OOM
+
+Generalized, reusable lessons for diagnosing Prometheus storage and crashloop problems on Kubernetes.
+
+### `retention.size` cap looks "not enforced" — it's a corrupt WAL that can't truncate
+**Symptom:** A Prometheus TSDB PVC is far over its `--storage.tsdb.retention.size` cap (e.g. 21G on a 10GB cap); the cap appears ignored. `du` shows the data dir is almost entirely `wal/`, with blocks near zero.
+**Cause:** `retention.size`/`retention.time` govern only persisted **blocks** — they do nothing to `wal/` or `chunks_head/`. A disk-full (ENOSPC) event that tore a WAL segment mid-write leaves a corrupt segment. Every 2h compaction then logs `compaction failed … WAL truncation … corruption in segment … unexpected full record` and the WAL is never truncated, so it grows unbounded.
+**Fix:** Restart the Prometheus pod. Prometheus auto-repairs a corrupt WAL **only on startup replay** (never during runtime compaction), so a long-Running pod with 0 restarts never gets the chance. Startup logs show `Encountered WAL read error, attempting repair` → `Deleting all segments newer than corrupted segment` → `Successfully repaired WAL` → `TSDB started`. Diagnose first: `du -xh -d1 <prometheus-db>` (mostly `wal/`?) + `logs <pod> -c prometheus | grep "compaction failed.*WAL truncation"` (names the segment).
+**Note:** Safe when corruption is at an early live segment (cheap replay, no OOM). Even after the fix, steady-state total ≈ blocks + small WAL (~0.2–0.5G) + head, so total can sit slightly above the cap; set `retentionSize` a bit lower (e.g. 8GB) for a hard total ≤10G. Distinct from the OOM case below — tell them apart by the terminated reason (ENOSPC/corrupt-WAL errors in logs = this one).
+
+### CrashLoop with OOMKilled(137) during "Replaying WAL" — raise the memory limit, don't touch data
+**Symptom:** Prometheus pod in CrashLoopBackOff; the `prometheus` container's `lastState.terminated = OOMKilled / exit 137` **while logs are mid "Replaying WAL, this may take a while"** (healthy blocks found, WAL segments loading `segment=N maxSegment=M`, then killed). Restart counts climb into the hundreds/thousands.
+**Cause:** Memory limit too small to replay the accumulated WAL. OOM before replay finishes → head never compacts → WAL never truncates → every restart replays the same oversized WAL → OOM again. Self-perpetuating.
+**Fix:** Raise the container memory limit enough to complete replay **once** — it then compacts the head to a block, truncates the WAL, and steady-state memory drops. Operator-managed: `kubectl patch prometheus <name> --type=merge -p '{"spec":{"resources":{"limits":{"memory":"10Gi"}}}}'`. Check the node has the free RAM first (`kubectl top nodes`). Non-destructive — keeps all data.
+**Note:** Do NOT delete the WAL (loses un-compacted head data) and do NOT just restart the pod (restart alone re-OOMs). The tell vs. the corrupt-WAL case: OOMKilled(137) **during replay** = raise RAM; corruption errors in logs = restart repairs.

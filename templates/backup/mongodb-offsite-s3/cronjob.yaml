@@ -1,0 +1,240 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPLATE — Standalone OFF-SITE MongoDB backup → S3 (vendor-neutral)
+#
+# WHAT: a daily CronJob that streams `mongodump --archive --gzip` through an in-pod
+#   FIFO straight to `aws s3 cp -` — NO custom image, NOTHING staged on node disk.
+#   A 3rd container posts a chat (Discord-style) notification on BOTH success and
+#   failure. Self-verifies the uploaded object exists, then prunes to the newest N.
+#
+# WHY STANDALONE (not an operator backup task): database backup operators often drive
+#   only ONE storage at a time, so an "off-site" task can silently land in the wrong
+#   (in-cluster) store while its status still reads `ready`. This job owns its off-site
+#   copy end to end, independent of any operator storage pointer.
+#
+# PLACEHOLDERS — replace every <TOKEN> with your real value:
+#   <NAMESPACE>              namespace where the DB + its creds secret live
+#   <CLUSTER_LABEL>          human cluster name for the notification (e.g. "prod-eu (PROD)")
+#   <MONGO_IMAGE>            mongodump image — MUST match the live server version.
+#                             operator-managed (e.g. Percona psmdb): use .spec.image of the DB
+#                             (e.g. percona/percona-server-mongodb:<version>)
+#   <DUMP_HOST>             the mongodump --host target:
+#                             SHARDED  → a mongos:  <release>-mongos-0.<NAMESPACE>.svc.cluster.local:27017
+#                             REPLICASET → an rs member: <release>-rs0-0.<release>-rs0.<NAMESPACE>.svc.cluster.local:27017
+#   <BACKUP_USER_SECRET>    secret holding the (read) backup user
+#   <BACKUP_USER_KEY>       key in that secret for the username
+#   <BACKUP_PASS_KEY>       key in that secret for the password
+#   <AWS_CREDS_SECRET>      secret with S3 creds — keys AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+#                             NOTE: envFrom injects ALL keys; if this secret also carries its own
+#                             S3_BUCKET / AWS_DEFAULT_REGION you DON'T want, switch to two
+#                             explicit secretKeyRef env vars instead of envFrom (see commented block).
+#   <S3_REGION>             e.g. us-east-1
+#   <S3_BUCKET>            destination bucket
+#   <S3_PREFIX>             key prefix, e.g. standalone-mongodump
+#   <ARCHIVE_NAME>          object basename, e.g. <cluster>-mongodb.archive.gz
+#   <RETENTION_COPIES>      how many newest daily copies to keep (e.g. 3)
+#   <SCHEDULE_CRON_UTC>     cron, UTC — stagger clear of other backup tasks (e.g. "0 4 * * *")
+#   <EXPECTED_SIZE_BYTES>   aws s3 cp --expected-size hint (bytes), ~2× the dump size (e.g. 40000000000)
+#   <NOTIFY_WEBHOOK_SECRET> secret holding the chat webhook (key WEBHOOK_URL)
+#   <DUMP_TIMEOUT_SECONDS>  inner mongodump timeout (sec) < activeDeadline (e.g. 7200 for a 2h cap)
+#   # S3-compatible endpoint (MinIO/Ceph/R2/etc.) instead of real AWS? add to the upload container's env:
+#   #   - { name: AWS_ENDPOINT_URL, value: "<https://your-endpoint>" }   and pass --endpoint-url "$AWS_ENDPOINT_URL"
+#   #   OLD MinIO rejects multipart checksum → also add the two checksum lines (see postgres templates).
+#
+# TLS (OPTIONAL BLOCK): omitted by default (non-TLS dump endpoint). If your mongos/member
+#   requires TLS, UNCOMMENT the two marked blocks (ca volume + mount) and add
+#   `--tls --tlsCAFile=/tls/ca.crt` to the mongodump line; mount the DB's ssl secret (key ca.crt).
+#   Placeholder: <MONGO_SSL_SECRET>.
+#
+# APPLY (mutating → owner approval + single-use APPROVE_NEXT; apply from FILE, heredoc is blocked):
+#     kubectl --context <CTX> apply -f <this-file-with-real-values>.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mongodb-offsite-backup-s3
+  namespace: <NAMESPACE>
+  labels:
+    app.kubernetes.io/name: mongodb-offsite-backup-s3
+    purpose: offsite-dr
+spec:
+  schedule: "<SCHEDULE_CRON_UTC>"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid          # never run two dumps at once
+  startingDeadlineSeconds: 3600      # a missed run (e.g. node reboot) still starts within 1h
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5          # keep failures visible
+  jobTemplate:
+    spec:
+      backoffLimit: 1                # one retry, then the Job is marked Failed
+      activeDeadlineSeconds: 14400   # 4h hard cap; keep > DUMP_TIMEOUT_SECONDS + notify wait
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: mongodb-offsite-backup-s3
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            fsGroup: 1001            # so all 3 containers share /work (the FIFO + status files)
+          volumes:
+            - name: work
+              emptyDir: { sizeLimit: 64Mi }   # only a FIFO + tiny status files live here
+            # --- OPTIONAL TLS: uncomment if the dump endpoint requires TLS ---
+            # - name: tls
+            #   secret: { secretName: <MONGO_SSL_SECRET>, items: [{ key: ca.crt, path: ca.crt }] }
+          containers:
+            # ── 1. DUMP: mongodump → FIFO. Streams; stages nothing. ──────────────────────────
+            - name: dump
+              image: <MONGO_IMAGE>
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: U
+                  valueFrom: { secretKeyRef: { name: <BACKUP_USER_SECRET>, key: <BACKUP_USER_KEY> } }
+                - name: P
+                  valueFrom: { secretKeyRef: { name: <BACKUP_USER_SECRET>, key: <BACKUP_PASS_KEY> } }
+                - name: DUMP_HOST
+                  value: "<DUMP_HOST>"
+                - name: DUMP_TIMEOUT
+                  value: "<DUMP_TIMEOUT_SECONDS>"
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -u
+                  drc=1
+                  trap 'echo "$drc" > /work/dump.rc' EXIT      # ALWAYS publish our exit code
+                  mkfifo /work/pipe 2>/dev/null || true
+                  echo "[$(date -u +%FT%TZ)] mongodump (whole cluster) → FIFO"
+                  # Full logical dump of ALL databases. secondaryPreferred spares the primary.
+                  # SHARDED: $DUMP_HOST is a mongos → captures every shard.
+                  # REPLICASET: $DUMP_HOST is an rs member.
+                  # timeout: on a hang, kill the dump → close the FIFO → upload sees EOF → clean FAIL
+                  # (no silent hang to the Job deadline).
+                  timeout -s TERM -k 30 "$DUMP_TIMEOUT" \
+                    mongodump --host "$DUMP_HOST" -u "$U" -p "$P" --authenticationDatabase admin \
+                      --readPreference=secondaryPreferred --numParallelCollections=2 \
+                      --gzip --archive > /work/pipe
+                  drc=$?
+                  echo "[$(date -u +%FT%TZ)] mongodump rc=$drc"
+                  exit $drc
+                  # --- OPTIONAL TLS: add to the mongodump line above ---
+                  #   --tls --tlsCAFile=/tls/ca.crt
+              volumeMounts:
+                - { name: work, mountPath: /work }
+                # - { name: tls, mountPath: /tls, readOnly: true }   # OPTIONAL TLS
+              resources:
+                requests: { cpu: "250m", memory: "512Mi" }
+                limits:   { cpu: "1",    memory: "1Gi" }
+
+            # ── 2. UPLOAD: FIFO → S3; verify object; decide OK/FAIL; prune to newest N. ───────
+            - name: upload
+              image: public.ecr.aws/aws-cli/aws-cli:latest
+              imagePullPolicy: IfNotPresent
+              envFrom:
+                - secretRef: { name: <AWS_CREDS_SECRET> }   # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+              # --- If <AWS_CREDS_SECRET> ALSO carries its own S3_BUCKET/AWS_DEFAULT_REGION you don't
+              #     want (envFrom would override the literals below), DROP the envFrom above and use:
+              # env:
+              #   - name: AWS_ACCESS_KEY_ID
+              #     valueFrom: { secretKeyRef: { name: <AWS_CREDS_SECRET>, key: AWS_ACCESS_KEY_ID } }
+              #   - name: AWS_SECRET_ACCESS_KEY
+              #     valueFrom: { secretKeyRef: { name: <AWS_CREDS_SECRET>, key: AWS_SECRET_ACCESS_KEY } }
+              env:
+                - { name: AWS_DEFAULT_REGION, value: "<S3_REGION>" }
+                - { name: S3_BUCKET,          value: "<S3_BUCKET>" }
+                - { name: S3_PREFIX,          value: "<S3_PREFIX>" }
+                - { name: ARCHIVE_NAME,       value: "<ARCHIVE_NAME>" }
+                - { name: EXPECTED_SIZE,      value: "<EXPECTED_SIZE_BYTES>" }
+                - { name: RETENTION_COPIES,   value: "<RETENTION_COPIES>" }   # keep ONLY the N newest copies
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -u
+                  STATUS=FAIL; REASON="unknown"
+                  # ALWAYS publish the final verdict so the notifier can act (even on our own error).
+                  trap 'printf "%s" "$STATUS" > /work/final.status; printf "%s" "$REASON" > /work/final.reason' EXIT
+                  TS="$(date -u +%Y-%m-%dT%H%M%SZ)"
+                  KEY="${S3_PREFIX}/${TS}/${ARCHIVE_NAME}"
+                  echo "[$(date -u +%FT%TZ)] waiting for FIFO, then upload → s3://${S3_BUCKET}/${KEY}"
+                  i=0; while [ ! -p /work/pipe ] && [ $i -lt 120 ]; do sleep 1; i=$((i+1)); done
+                  aws s3 cp - "s3://${S3_BUCKET}/${KEY}" --expected-size "$EXPECTED_SIZE" < /work/pipe
+                  urc=$?
+                  # Wait for the dump container's rc (never call a truncated stream a success).
+                  i=0; while [ ! -f /work/dump.rc ] && [ $i -lt 180 ]; do sleep 5; i=$((i+1)); done
+                  drc="$(cat /work/dump.rc 2>/dev/null || echo 99)"
+                  echo "[$(date -u +%FT%TZ)] upload rc=$urc dump rc=$drc"
+                  if [ "$urc" = 0 ] && [ "$drc" = 0 ] && aws s3 ls "s3://${S3_BUCKET}/${KEY}" >/dev/null 2>&1; then
+                    STATUS=OK; REASON="s3://${S3_BUCKET}/${KEY}"
+                    echo "[$(date -u +%FT%TZ)] verified object present; pruning to the newest ${RETENTION_COPIES} copies"
+                    DIRS="$(aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" | awk '{print $2}' | sed 's#/$##' | grep -v '^$' | sort)"
+                    TOTAL="$(printf '%s\n' "$DIRS" | grep -c .)"
+                    REMOVE=$(( TOTAL - RETENTION_COPIES ))
+                    if [ "$REMOVE" -gt 0 ]; then
+                      printf '%s\n' "$DIRS" | head -n "$REMOVE" | while read -r D; do
+                        [ -z "$D" ] && continue
+                        echo "  pruning old dump ${D} (keeping newest ${RETENTION_COPIES})"
+                        aws s3 rm --recursive "s3://${S3_BUCKET}/${S3_PREFIX}/${D}/" >/dev/null
+                      done
+                    fi
+                  else
+                    REASON="upload rc=$urc dump rc=$drc (object missing/truncated after upload)"
+                  fi
+                  [ "$STATUS" = OK ] && exit 0 || exit 1
+              volumeMounts:
+                - { name: work, mountPath: /work }
+              resources:
+                requests: { cpu: "100m", memory: "256Mi" }
+                limits:   { cpu: "1",    memory: "1Gi" }   # OOM-kill here = SIGKILL skips the EXIT trap AND
+                                                           # drops the FIFO reader → mongodump blocks forever.
+
+            # ── 3. NOTIFY: POST a chat webhook on BOTH success and failure. ──────────────────
+            # Message always carries the CLUSTER label + run DATE. On failure includes the captured
+            # reason; if none was written, it says "check the cluster for more info".
+            - name: notify
+              image: curlimages/curl:latest
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: CLUSTER_LABEL
+                  value: "<CLUSTER_LABEL>"
+                - name: NS
+                  value: "<NAMESPACE>"
+                - name: WEBHOOK_URL
+                  valueFrom: { secretKeyRef: { name: <NOTIFY_WEBHOOK_SECRET>, key: WEBHOOK_URL } }
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -u
+                  # Wait for the verdict (< activeDeadline, so we still fire even if dump/upload hang
+                  # and the pod is about to be deadline-killed). Tune 2520*5s=3.5h to your deadline.
+                  i=0; while [ ! -f /work/final.status ] && [ $i -lt 2520 ]; do sleep 5; i=$((i+1)); done
+                  ST="$(cat /work/final.status 2>/dev/null || echo FAIL)"
+                  REASON="$(cat /work/final.reason 2>/dev/null || true)"
+                  DATE="$(date -u +%FT%TZ)"
+                  DIV="------------------------"
+                  # JSON-escape a value (backslash + double-quote). These values never contain real newlines.
+                  esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+                  CL="$(esc "$CLUSTER_LABEL")"; NSX="$(esc "$NS")"; DT="$(esc "$DATE")"
+                  if [ "$ST" = OK ]; then
+                    echo "[$DATE] backup OK — notifying (success)."
+                    OBJ="$(esc "$REASON")"
+                    TITLE="Backup completed"; COLOR=3066993
+                    DESC="**MongoDB off-site backup SUCCEEDED**\n\n**Cluster :** ${CL}\n**Date :** ${DT}\n**Namespace :** ${NSX}\n${DIV}\n**Off-site DR copy written:**\n${OBJ}"
+                  else
+                    echo "[$DATE] backup FAILED — notifying (failure). reason=$REASON"
+                    [ -z "$REASON" ] && REASON="no error message captured — check the cluster (kubectl logs the failed Job's dump/upload containers)"
+                    RS="$(esc "$REASON")"
+                    TITLE="Backup failed"; COLOR=15158332
+                    DESC="**MongoDB off-site backup FAILED**\n\n**Cluster :** ${CL}\n**Date :** ${DT}\n**Namespace :** ${NSX}\n${DIV}\n**Error :** ${RS}\nNo off-site DR copy was written for this run."
+                  fi
+                  # Discord-style EMBED (colored side-bar green=success / red=failure). Adjust the JSON
+                  # shape for a different chat system (Slack: {"text": "..."}).
+                  PAYLOAD="{\"embeds\":[{\"title\":\"${TITLE}\",\"color\":${COLOR},\"description\":\"${DESC}\"}]}"
+                  curl -sf -m 20 -H 'Content-Type: application/json' \
+                    -d "${PAYLOAD}" "$WEBHOOK_URL" \
+                    || echo "WARN: webhook POST failed (URL / egress?)"
+                  exit 0   # the backup's own non-zero exit (containers 1/2) is what marks the Job Failed.
+              volumeMounts:
+                - { name: work, mountPath: /work }
+              resources:
+                requests: { cpu: "20m", memory: "32Mi" }
+                limits:   { cpu: "200m", memory: "64Mi" }

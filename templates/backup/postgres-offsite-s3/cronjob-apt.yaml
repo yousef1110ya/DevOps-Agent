@@ -1,0 +1,93 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPLATE — PostgreSQL OFF-SITE backup → S3  ·  SHAPE A (apt + single container)
+#
+# WHAT: a CronJob that, in ONE stock `postgres:<major>` container, `apt-get install`s
+#   awscli, then streams `pg_dump | aws s3 cp -` straight to S3 — nothing staged on disk.
+#
+# USE SHAPE A when the pod CAN reach the apt mirror (egress open). If apt is blocked
+#   (e.g. `deb.debian.org 403`), use cronjob-two-image.yaml instead.
+#
+# PLACEHOLDERS — replace every <TOKEN>:
+#   <NAMESPACE>             namespace to run in (often where the DB / creds live)
+#   <PG_MAJOR>             pin to the LIVE server major (dump from a mismatched major may not restore)
+#   <DB_HOST>             Postgres service host (e.g. <cluster>-rw.<ns> for a CNPG rw service)
+#   <DB_NAME>             database to dump
+#   <DB_USER>             role to dump as (SELECT on the DB)
+#   <CREDS_SECRET>        secret holding the DB password + S3 creds (keys below). envFrom injects ALL keys.
+#     expected keys in <CREDS_SECRET>:
+#       PGPASSWORD              Postgres password for <DB_USER>
+#       AWS_ACCESS_KEY_ID       S3 access key
+#       AWS_SECRET_ACCESS_KEY   S3 secret key
+#   <S3_REGION>            e.g. us-east-1
+#   <S3_BUCKET>            destination bucket
+#   <S3_ENDPOINT_URL>     S3-compatible endpoint (MinIO/Ceph/R2/etc.), e.g. http://minio.<ns>:80
+#                           For REAL AWS S3, delete the `--endpoint-url "$S3_ENDPOINT_URL"` flags
+#                           and the S3_ENDPOINT_URL env var.
+#   <SCHEDULE_CRON_UTC>   cron (e.g. "0 */2 * * *" for every 2h)
+#
+# APPLY (mutating → owner approval + single-use APPROVE_NEXT; apply from FILE, heredoc is blocked):
+#     kubectl --context <CTX> apply -f <this-file-with-real-values>.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-offsite-backup
+  namespace: <NAMESPACE>
+  labels:
+    app.kubernetes.io/name: postgres-offsite-backup
+    purpose: offsite-dr
+spec:
+  schedule: "<SCHEDULE_CRON_UTC>"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid          # never two dumps at once
+  startingDeadlineSeconds: 300        # a missed run still fires
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3           # keep failures visible
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1800      # 30m hard cap (raise for a large DB)
+      backoffLimit: 2                  # a couple of retries, then mark Failed (no pod pile-up)
+      template:
+        spec:
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 30
+          containers:
+            - name: postgres-backup
+              image: postgres:<PG_MAJOR>
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  apt-get update
+                  apt-get install -y awscli
+                  export AWS_DEFAULT_REGION="${S3_REGION:-us-east-1}"
+                  # OLD MinIO (and some S3-compatible stores) reject aws-cli's default multipart
+                  # checksum → force single-part PUT + disable the new checksum. Harmless on real AWS.
+                  export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+                  aws configure set default.s3.multipart_threshold 4GB
+                  TS="$(date -u +'%Y-%m-%dT%H%M%SZ')"
+                  DEST="s3://${S3_BUCKET}/${DB_NAME}/out-${DB_NAME}-${TS}.sql.gz"
+                  echo "Ensuring bucket s3://${S3_BUCKET} exists ..."
+                  aws --endpoint-url "$S3_ENDPOINT_URL" s3 mb "s3://${S3_BUCKET}" 2>/dev/null || true
+                  echo "Dumping ${DB_NAME} from ${DB_HOST} → ${DEST} (streaming, nothing staged) ..."
+                  # pg_dump (single DB) | gzip | upload, streamed. With set -o pipefail a pg_dump
+                  # failure aborts the whole pipe → no truncated/empty object is uploaded as "success".
+                  pg_dump -U "$DB_USER" -h "$DB_HOST" -w "$DB_NAME" | gzip \
+                    | aws --endpoint-url "$S3_ENDPOINT_URL" s3 cp --no-progress - "$DEST"
+                  echo "Verifying object exists + is non-empty ..."
+                  SZ="$(aws --endpoint-url "$S3_ENDPOINT_URL" s3 ls "$DEST" | awk '{print $3}')"
+                  [ -n "${SZ:-}" ] && [ "$SZ" -gt 0 ] || { echo "FAIL: ${DEST} missing or 0 bytes"; exit 1; }
+                  echo "Backup complete: ${DEST} (${SZ} bytes)."
+              envFrom:
+                - secretRef:
+                    name: <CREDS_SECRET>        # PGPASSWORD / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+              env:
+                - { name: S3_REGION,       value: "<S3_REGION>" }
+                - { name: S3_BUCKET,       value: "<S3_BUCKET>" }
+                - { name: S3_ENDPOINT_URL, value: "<S3_ENDPOINT_URL>" }   # delete for real AWS S3
+                - { name: DB_HOST,         value: "<DB_HOST>" }
+                - { name: DB_NAME,         value: "<DB_NAME>" }
+                - { name: DB_USER,         value: "<DB_USER>" }
+              resources:
+                requests: { cpu: "100m", memory: "256Mi" }
+                limits:   { cpu: "1",    memory: "512Mi" }

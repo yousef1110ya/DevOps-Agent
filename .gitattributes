@@ -1,0 +1,31 @@
+# Normalize line endings across the team so the bash hooks/scripts keep working everywhere.
+# Shell scripts and the renderer MUST stay LF (they run under bash on Linux and Git Bash on
+# Windows; CRLF would break shebangs / `bash` execution). .docx are binary.
+* text=auto eol=lf
+*.sh   text eol=lf
+*.mjs  text eol=lf
+*.py   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.log  text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.docx binary
+
+# --- Conflict policy (AGENTS.md rule 14): NEVER lose either side's data ---
+# The built-in `union` merge driver resolves a conflict by keeping BOTH versions of the conflicting
+# hunk (concatenated, no conflict markers) — so no knowledge from either teammate is ever dropped.
+# Applied to human-readable DATA only (knowledge, playbooks, reports .md, audit logs, text). It may
+# occasionally duplicate a line/heading — that's the "clean it later" case, never a deletion.
+*.md  merge=union
+*.log merge=union
+*.txt merge=union
+# Code / config are deliberately NOT union-merged — concatenating both versions would corrupt a
+# script or make invalid JSON/YAML. A conflict in these pauses for review (git-sync warns; nothing
+# deleted). Resolve keeping both sides.
+*.sh   merge=text
+*.mjs  merge=text
+*.py   merge=text
+*.json merge=text
+*.yaml merge=text
+*.yml  merge=text

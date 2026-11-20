@@ -1,0 +1,27 @@
+# .gitignore — shared DevSecOps cluster-ops workspace
+# Policy: almost everything is shared as-is (knowledge, playbooks, scans, templates, hooks, audit
+# trail). Only what must NOT sync is excluded.
+
+# 1) Regenerable dependencies — never sync (rebuild with: npm --prefix templates/reports install)
+node_modules/
+
+# 2) Transient runtime state — must NOT propagate to teammates.
+#    state/APPROVE_NEXT is a SINGLE-USE destructive-command approval token; syncing it could
+#    auto-approve a destructive kubectl on someone else's machine.
+state/
+
+# 3) FULL command logs — LOCAL ONLY. They capture full command OUTPUT, which can contain secrets
+#    (get secret -o yaml, env dumps, tokens). The SHAREABLE record is audit/ (metadata only), which
+#    IS committed.
+logs/
+
+# 4) Rendered report deliverables are regenerable from the .md source; keep the repo lean.
+#    (Comment this out if you prefer to commit the .docx deliverables.)
+reports/*.docx
+
+# 5) Anything a team marks local-only (credentials staged for a human, device-specific notes):
+#    name them *.local.* and they never sync.
+*.local.txt
+*.local.md
+*.local.json
+.*-token

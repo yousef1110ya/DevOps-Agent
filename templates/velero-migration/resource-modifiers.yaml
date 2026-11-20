@@ -1,0 +1,59 @@
+# =============================================================================
+# Velero Resource-Modifiers ConfigMap  —  applied on the TARGET before the restore,
+# passed to the restore with:  --resource-modifier-configmap velero-restore-modifiers
+#
+# Two mergePatch rules, both proven on real migrations:
+#
+#   RULE 1 (persistentvolumeclaims): NULL spec.volumeName + the static-bind annotations.
+#     WHY: a config-only backup (PVs excluded) keeps each PVC's source spec.volumeName, so on
+#          restore Velero statically binds it to a PV that doesn't exist -> PVC stuck Pending
+#          forever ("unbound immediate PersistentVolumeClaims"), and volumeName is IMMUTABLE so
+#          you cannot fix it after the fact. Nulling it here makes the dynamic provisioner
+#          re-provision each PVC EMPTY in ONE step (no post-restore delete/recreate dance).
+#
+#   RULE 2 (cronjobs): set spec.suspend: true on ALL CronJobs.
+#     WHY: the empty target must NOT fire backup CronJobs into the SHARED backup buckets (it
+#          would overwrite the source's real backups) and must NOT run source-environment
+#          automation. Re-enable only what the NEW cluster should own, after it has its own
+#          backup destination.
+#
+# Velero Resource Modifiers are supported on Velero v1.11+ (mergePatch tested on v1.18).
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-restore-modifiers
+  namespace: velero
+data:
+  resource-modifiers.yaml: |
+    version: v1
+    resourceModifierRules:
+      # ---- RULE 1: strip the stale static bind so PVCs re-provision empty ----
+      - conditions:
+          groupResource: persistentvolumeclaims
+        patches:
+          - operation: merge
+            mergePatch: |
+              {
+                "spec": {
+                  "volumeName": null
+                },
+                "metadata": {
+                  "annotations": {
+                    "pv.kubernetes.io/bind-completed": null,
+                    "pv.kubernetes.io/bound-by-controller": null,
+                    "volume.kubernetes.io/selected-node": null
+                  }
+                }
+              }
+      # ---- RULE 2: suspend every CronJob (protect shared backup buckets) ----
+      - conditions:
+          groupResource: cronjobs.batch
+        patches:
+          - operation: merge
+            mergePatch: |
+              {
+                "spec": {
+                  "suspend": true
+                }
+              }

@@ -1,0 +1,116 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPLATE — PostgreSQL OFF-SITE backup → S3  ·  SHAPE B (two-image, no apt)
+#
+# WHAT: a `postgres:<major>` initContainer runs `pg_dump` into a small emptyDir, then an
+#   `amazon/aws-cli` container uploads it to S3. No `apt-get` at runtime.
+#
+# USE SHAPE B when the pod CANNOT reach the apt mirror (apt egress blocked, e.g.
+#   `deb.debian.org 403`). Also the more robust default — both images already carry
+#   their tool, so nothing is installed or downloaded at runtime.
+#   (Staging to the emptyDir is forced by the no-apt constraint; it is NOT staged to the
+#   node's real disk — emptyDir is a small scratch volume. Keep the DB modest or size it.)
+#
+# PLACEHOLDERS — replace every <TOKEN>:
+#   <NAMESPACE>            namespace to run in
+#   <PG_MAJOR>            pin to the LIVE server major (dump from a mismatched major may not restore)
+#   <DB_HOST>            Postgres service host (e.g. <cluster>-rw.<ns> for a CNPG rw service)
+#   <DB_NAME>            database to dump
+#   <DB_USER>            role to dump as (SELECT on the DB)
+#   <DB_PASS_SECRET>     secret holding the DB password
+#   <DB_PASS_KEY>        key in that secret for PGPASSWORD
+#   <AWS_CREDS_SECRET>   secret with S3 creds — keys AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+#   <S3_REGION>           e.g. us-east-1
+#   <S3_BUCKET>           destination bucket
+#   <S3_ENDPOINT_URL>    S3-compatible endpoint (MinIO/Ceph/R2/etc.), e.g. http://minio.<ns>:80
+#                          For REAL AWS S3, delete the `--endpoint-url "$S3_ENDPOINT_URL"` flags + env var.
+#   <SCHEDULE_CRON_UTC>  cron (e.g. "0 */2 * * *")
+#   <EMPTYDIR_LIMIT>     scratch size for the dump, e.g. 2Gi (set > the uncompressed dump)
+#
+# APPLY (mutating → owner approval + single-use APPROVE_NEXT; apply from FILE, heredoc is blocked):
+#     kubectl --context <CTX> apply -f <this-file-with-real-values>.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-offsite-backup
+  namespace: <NAMESPACE>
+  labels:
+    app.kubernetes.io/name: postgres-offsite-backup
+    purpose: offsite-dr
+spec:
+  schedule: "<SCHEDULE_CRON_UTC>"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1800
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 30
+          volumes:
+            - name: backup
+              emptyDir: { sizeLimit: <EMPTYDIR_LIMIT> }
+          # ── 1. pg_dump → emptyDir (initContainer; completes before upload starts) ──────────
+          initContainers:
+            - name: pg-dump
+              image: postgres:<PG_MAJOR>
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  echo "Dumping ${DB_NAME} from ${DB_HOST} → /backup/dump.sql.gz ..."
+                  pg_dump -U "$DB_USER" -h "$DB_HOST" -w "$DB_NAME" | gzip > /backup/dump.sql.gz
+                  # Abort on an empty dump — never hand the uploader a 0-byte "backup".
+                  SZ="$(wc -c < /backup/dump.sql.gz)"
+                  [ "$SZ" -gt 0 ] || { echo "FAIL: dump is 0 bytes"; exit 1; }
+                  echo "dump size: $(du -h /backup/dump.sql.gz | cut -f1) (${SZ} bytes)"
+              env:
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: <DB_PASS_SECRET>, key: <DB_PASS_KEY> } }
+                - { name: DB_HOST, value: "<DB_HOST>" }
+                - { name: DB_NAME, value: "<DB_NAME>" }
+                - { name: DB_USER, value: "<DB_USER>" }
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+              resources:
+                requests: { cpu: "100m", memory: "256Mi" }
+                limits:   { cpu: "1",    memory: "512Mi" }
+          # ── 2. upload emptyDir → S3; verify object is present + non-empty ─────────────────
+          containers:
+            - name: upload
+              image: amazon/aws-cli:latest
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  export AWS_DEFAULT_REGION="${S3_REGION:-us-east-1}"
+                  # OLD MinIO rejects aws-cli's default multipart checksum → single-part + no new checksum.
+                  export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+                  aws configure set default.s3.multipart_threshold 4GB
+                  TS="$(date -u +'%Y-%m-%dT%H%M%SZ')"
+                  DEST="s3://${S3_BUCKET}/${DB_NAME}/out-${DB_NAME}-${TS}.sql.gz"
+                  echo "Ensuring bucket + uploading → ${DEST} ..."
+                  aws --endpoint-url "$S3_ENDPOINT_URL" s3 mb "s3://${S3_BUCKET}" 2>/dev/null || true
+                  aws --endpoint-url "$S3_ENDPOINT_URL" s3 cp --no-progress /backup/dump.sql.gz "$DEST"
+                  echo "Verifying object exists + is non-empty ..."
+                  SZ="$(aws --endpoint-url "$S3_ENDPOINT_URL" s3 ls "$DEST" | awk '{print $3}')"
+                  [ -n "${SZ:-}" ] && [ "$SZ" -gt 0 ] || { echo "FAIL: ${DEST} missing or 0 bytes"; exit 1; }
+                  echo "Backup complete: ${DEST} (${SZ} bytes)."
+              envFrom:
+                - secretRef:
+                    name: <AWS_CREDS_SECRET>     # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+              env:
+                - { name: S3_REGION,       value: "<S3_REGION>" }
+                - { name: S3_BUCKET,       value: "<S3_BUCKET>" }
+                - { name: S3_ENDPOINT_URL, value: "<S3_ENDPOINT_URL>" }   # delete for real AWS S3
+                - { name: DB_NAME,         value: "<DB_NAME>" }
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+              resources:
+                requests: { cpu: "100m", memory: "256Mi" }
+                limits:   { cpu: "1",    memory: "512Mi" }

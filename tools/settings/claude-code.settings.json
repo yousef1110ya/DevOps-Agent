@@ -1,0 +1,47 @@
+{
+  "_comment": "Example Claude Code hook wiring for this workspace. Copy to .claude/settings.json at the repo root, then restart Claude Code (or run /hooks) to approve the hooks. $CLAUDE_PROJECT_DIR resolves to the repo root. For any OTHER harness, map these four lifecycle points (session start / pre-Bash / post-Bash / session stop) to your harness's equivalent, and export AGENT_PROJECT_DIR=<repo root> so git-sync.sh finds the repo. The git-sync hooks no-op until you add a git remote (see onboarding.md).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/tools/hooks/git-sync.sh\" pull"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/tools/hooks/guard.sh\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/tools/hooks/logger.sh\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/tools/hooks/git-sync.sh\" push"
+          }
+        ]
+      }
+    ]
+  }
+}

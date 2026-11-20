@@ -1,0 +1,13 @@
+{
+  "name": "cluster-ops-reports",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Renders ops report Markdown (.md) files to Word (.docx). The .md files remain the source of truth; this only produces a Word copy on demand.",
+  "scripts": {
+    "report": "node md-to-docx.mjs"
+  },
+  "dependencies": {
+    "docx": "9.7.1"
+  }
+}
